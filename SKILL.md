@@ -73,6 +73,53 @@ node {baseDir}/scripts/stations.mjs 杭州
 node {baseDir}/scripts/stations.mjs 香港西九龙
 ```
 
+## AI Transfer Search
+
+```bash
+node {baseDir}/scripts/transfer.mjs <from> <to> [options]
+```
+
+AI-powered transfer recommendation: BFS searches all possible transfer stations, LLM ranks results by user preference.
+
+### Examples
+
+```bash
+# Basic transfer search (default up to 3 transfers)
+node {baseDir}/scripts/transfer.mjs 北京 上海
+
+# With preference for LLM ranking
+node {baseDir}/scripts/transfer.mjs 北京 广州 --preference "省钱优先"
+
+# Limit to 1 transfer, minimum 20min transfer time
+node {baseDir}/scripts/transfer.mjs 北京 深圳 --max-transfers 1 --min-transfer 20
+
+# Skip LLM, heuristic ranking only
+node {baseDir}/scripts/transfer.mjs 武汉 上海 --no-llm
+
+# JSON output for programmatic use
+node {baseDir}/scripts/transfer.mjs 成都 重庆 --json
+```
+
+### Options
+
+- `-d, --date <YYYY-MM-DD>`: Travel date (default: today)
+- `--max-transfers <n>`: Max transfers (default: 3, max 3)
+- `--min-transfer <minutes>`: Min transfer time in minutes (default: 10)
+- `--preference <text>`: User preference for LLM ranking (e.g., "省钱优先", "最快到达", "带老人要舒适")
+- `-t, --type <G|D|Z|T|K>`: Filter train types
+- `--seat <types>`: Seat type filter (comma-separated)
+- `-f, --format <md|html|json>`: Output format (default: md)
+- `--model <name>`: OpenAI model (default: gpt-4o-mini)
+- `--no-llm`: Skip LLM, use heuristic ranking only
+
+### Features
+
+- **BFS search**: Explores all stations, not just major hubs
+- **Same-train seat change**: Automatically detects when buying two segments of the same train works better than a transfer
+- **LLM ranking**: Understands natural language preferences like "省钱", "最快", "舒适"
+- **Multi-transfer**: Supports up to 3 transfers
+- **Requires**: `OPENAI_API_KEY` environment variable (for LLM ranking)
+
 ## Important Notes for AI Assistant
 
 ### ⚠️ Station Name Resolution Warning
