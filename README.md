@@ -1,11 +1,11 @@
 # 12306 火车票查询 & AI 换乘推荐
 
-[Clawhub](https://clawhub.ai/kirorab/12306) Skill — 查询中国铁路 12306 列车时刻表、余票信息，以及 AI 驱动的智能换乘推荐。
+[Clawhub](https://clawhub.ai/Waylon524/12306) Skill — 查询中国铁路 12306 列车时刻表、余票信息，以及 AI 驱动的智能换乘推荐。
 
 ## 安装
 
 ```bash
-npx skills add kirorab/12306-skill
+npx skills add Waylon524/12306-skill
 ```
 
 ## 依赖
@@ -125,3 +125,8 @@ node scripts/stations.mjs 香港西九龙
 ## 数据来源
 
 直接调用 12306 官方 API，无需任何 API Key。站点数据自动缓存 7 天。
+
+## 贡献者
+
+- [kirorab](https://github.com/kirorab) — 原始作者
+- [Waylon524](mailto:lendfuz524@gmail.com) — AI 换乘推荐功能
