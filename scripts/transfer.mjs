@@ -19,6 +19,7 @@ const { values, positionals } = parseArgs({
     format:         { type: 'string', short: 'f', default: 'md' },
     model:          { type: 'string', default: 'gpt-4o-mini' },
     'no-llm':       { type: 'boolean', default: false },
+    json:           { type: 'boolean', default: false },
     help:           { type: 'boolean', short: 'h', default: false },
   },
   allowPositionals: true,
@@ -36,14 +37,17 @@ Options:
   -t, --type <G|D|Z|T|K>        Filter train types
   --seat <types>                 Seat type filter (comma-separated)
   -f, --format <md|html|json>    Output format (default: md)
+  --json                         Shortcut for --format json
   --model <name>                 OpenAI model (default: gpt-4o-mini)
   --no-llm                       Skip LLM ranking`);
   process.exit(1);
 }
 
 const date = values.date || new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
-const maxTransfers = Math.min(parseInt(values['max-transfers']) || 3, 3);
-const minTransferTime = parseInt(values['min-transfer']) || 10;
+const rawMax = parseInt(values['max-transfers']);
+const maxTransfers = Math.min(isNaN(rawMax) ? 3 : rawMax, 3);
+const rawMin = parseInt(values['min-transfer']);
+const minTransferTime = isNaN(rawMin) ? 10 : rawMin;
 const trainTypeFilter = (values.type || '').toUpperCase();
 const useLLM = !values['no-llm'];
 
@@ -120,6 +124,31 @@ async function queryTickets(from, to, travelDate, cookie) {
   return json.data.result.map(r => parseTicket(r, stationData.STATIONS));
 }
 
+async function queryTicketsSafe(from, to, travelDate, cookie) {
+  try {
+    const params = new URLSearchParams({
+      'leftTicketDTO.train_date': travelDate,
+      'leftTicketDTO.from_station': from.station_code,
+      'leftTicketDTO.to_station': to.station_code,
+      purpose_codes: 'ADULT',
+    });
+
+    const res = await fetch(`https://kyfw.12306.cn/otn/leftTicket/query?${params}`, {
+      headers: { ...HEADERS, Cookie: cookie },
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const json = await res.json();
+    if (!json.data?.result) return [];
+    return json.data.result.map(r => parseTicket(r, stationData.STATIONS));
+  } catch (err) {
+    throw err;
+  }
+}
+
 function parseTicket(raw, stationMap) {
   const f = raw.split('|');
   const v = (key) => f[F[key]] || '--';
@@ -142,7 +171,7 @@ async function batchQuery(from, stations, travelDate, cookie, concurrency = 15) 
     const batch = stations.slice(i, i + concurrency);
     const batchResults = await Promise.allSettled(
       batch.map(async (to) => {
-        const tickets = await queryTickets(from, to, travelDate, cookie);
+        const tickets = await queryTicketsSafe(from, to, travelDate, cookie);
         return { toStation: to, tickets };
       })
     );
@@ -188,24 +217,29 @@ function gatherSeats(t) {
 // --- Layer 0: direct search ---
 
 async function searchDirect(origin, destination, date, cookie) {
-  const tickets = await queryTickets(origin, destination, date, cookie);
-  return tickets.map(t => ({
-    segments: [{
-      trainCode: t.trainCode, trainNo: t.trainNo,
-      fromStation: t.fromStation, toStation: t.toStation,
-      fromCode: t.fromCode, toCode: t.toCode,
-      departTime: t.departTime, arriveTime: t.arriveTime,
-      duration: t.duration, canBuy: t.canBuy,
-      seats: gatherSeats(t),
-    }],
-    totalDuration: t.duration && t.duration !== '--' ? durationMinutes(t.duration) : 0,
-    transferCount: 0,
-    transferStations: [],
-    sameStationTransfer: null,
-    sameTrainSeatChange: null,
-    actualMinTransfer: 0,
-    score: 0,
-  }));
+  try {
+    const tickets = await queryTicketsSafe(origin, destination, date, cookie);
+    return tickets.map(t => ({
+      segments: [{
+        trainCode: t.trainCode, trainNo: t.trainNo,
+        fromStation: t.fromStation, toStation: t.toStation,
+        fromCode: t.fromCode, toCode: t.toCode,
+        departTime: t.departTime, arriveTime: t.arriveTime,
+        duration: t.duration, canBuy: t.canBuy,
+        seats: gatherSeats(t),
+      }],
+      totalDuration: t.duration && t.duration !== '--' ? durationMinutes(t.duration) : 0,
+      transferCount: 0,
+      transferStations: [],
+      sameStationTransfer: null,
+      sameTrainSeatChange: null,
+      actualMinTransfer: 0,
+      score: 0,
+    }));
+  } catch (err) {
+    console.error(`  direct search failed: ${err.message}`);
+    return [];
+  }
 }
 
 // --- BFS helper functions ---
@@ -305,8 +339,14 @@ async function bfsSearch(origin, destination, date, cookie, candidatePool, maxTr
 
     let destTickets = destResults.get(midStation.station_code);
     if (!destTickets) {
-      destTickets = await queryTickets(midStation, destination, date, cookie);
-      destResults.set(midStation.station_code, destTickets);
+      try {
+        destTickets = await queryTicketsSafe(midStation, destination, date, cookie);
+        destResults.set(midStation.station_code, destTickets);
+      } catch (err) {
+        console.error(`  goal-directed query failed for ${midStation.station_name} → ${destination.station_name}: ${err.message}`);
+        destResults.set(midStation.station_code, []);
+        continue;
+      }
     }
 
     for (const t2 of destTickets) {
@@ -343,8 +383,14 @@ async function bfsSearch(origin, destination, date, cookie, candidatePool, maxTr
         // Goal-directed: midStation2 → destination
         let destTickets = destResults.get(midStation2.station_code);
         if (!destTickets) {
-          destTickets = await queryTickets(midStation2, destination, date, cookie);
-          destResults.set(midStation2.station_code, destTickets);
+          try {
+            destTickets = await queryTicketsSafe(midStation2, destination, date, cookie);
+            destResults.set(midStation2.station_code, destTickets);
+          } catch (err) {
+            console.error(`  layer 2 goal-directed query failed for ${midStation2.station_name} → ${destination.station_name}: ${err.message}`);
+            destResults.set(midStation2.station_code, []);
+            continue;
+          }
         }
 
         for (const t3 of destTickets) {
@@ -373,8 +419,14 @@ async function bfsSearch(origin, destination, date, cookie, candidatePool, maxTr
           for (const { midStation3, ticket: t3 } of activeThirdHops) {
             let destTickets3 = destResults.get(midStation3.station_code);
             if (!destTickets3) {
-              destTickets3 = await queryTickets(midStation3, destination, date, cookie);
-              destResults.set(midStation3.station_code, destTickets3);
+              try {
+                destTickets3 = await queryTicketsSafe(midStation3, destination, date, cookie);
+                destResults.set(midStation3.station_code, destTickets3);
+              } catch (err) {
+                console.error(`  layer 3 goal-directed query failed for ${midStation3.station_name} → ${destination.station_name}: ${err.message}`);
+                destResults.set(midStation3.station_code, []);
+                continue;
+              }
             }
 
             for (const t4 of destTickets3) {
@@ -688,7 +740,7 @@ if (useLLM && routes.length > 0) {
 }
 
 // --- Output ---
-const fmt = values.format?.toLowerCase() || 'md';
+const fmt = values.json ? 'json' : (values.format?.toLowerCase() || 'md');
 
 if (fmt === 'json') {
   console.log(JSON.stringify({ from: fromStation.station_name, to: toStation.station_name, date, totalRoutes: routes.length, recommendations: finalResults }, null, 2));
