@@ -205,13 +205,15 @@ async function searchDirect(origin, destination, date, cookie) {
 // --- BFS helper functions ---
 
 function canConnect(prevArrive, nextDepart, minTransferMinutes) {
-  return parseTime(nextDepart) >= parseTime(prevArrive) + minTransferMinutes;
+  let prev = parseTime(prevArrive);
+  let next = parseTime(nextDepart);
+  // If next departure is earlier in the day than prev arrival,
+  // it must be the next calendar day — add 24h
+  if (next < prev) next += 24 * 60;
+  return next >= prev + minTransferMinutes;
 }
 
 function buildRoute(segments) {
-  const first = segments[0];
-  const last = segments[segments.length - 1];
-  const totalDur = segments.reduce((sum, s) => sum + durationMinutes(s.duration), 0);
   const transferStations = [];
   const minTransferTimes = [];
   let sameStation = true;
@@ -221,11 +223,18 @@ function buildRoute(segments) {
     const prev = segments[i - 1];
     const curr = segments[i];
     transferStations.push(prev.toStation);
-    const gap = parseTime(curr.departTime) - parseTime(prev.arriveTime);
+    let gap = parseTime(curr.departTime) - parseTime(prev.arriveTime);
+    if (gap < 0) gap += 24 * 60; // overnight adjustment
     minTransferTimes.push(gap);
     if (prev.toCode !== curr.fromCode) sameStation = false;
     if (prev.trainCode === curr.trainCode) sameTrain = true;
   }
+
+  // Compute total duration from first depart to last arrive, accounting for overnight
+  const firstDepart = parseTime(segments[0].departTime);
+  let lastArrive = parseTime(segments[segments.length - 1].arriveTime);
+  if (lastArrive < firstDepart) lastArrive += 24 * 60;
+  const totalDur = lastArrive - firstDepart;
 
   return {
     segments,
