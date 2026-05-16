@@ -82,6 +82,12 @@ function formatDuration(raw) {
   return h > 0 ? `${h}h${m.toString().padStart(2, '0')}m` : `${m}m`;
 }
 
+function formatDurationStr(minutes) {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h > 0 ? `${h}h${m.toString().padStart(2, '0')}m` : `${m}m`;
+}
+
 function hasSeat(val) {
   return val && val !== '--' && val !== '' && val !== '无';
 }
@@ -391,14 +397,85 @@ async function bfsSearch(origin, destination, date, cookie, candidatePool, maxTr
   return allRoutes;
 }
 
+// --- Post-processing: dedup, filter, rank ---
+
+function deduplicateRoutes(routes) {
+  const seen = new Map();
+  for (const route of routes) {
+    // Key = station sequence (as codes)
+    const key = route.segments.map(s => s.fromCode).join('-') + '-' + route.segments[route.segments.length - 1].toCode;
+    const existing = seen.get(key);
+    if (!existing || route.totalDuration < existing.totalDuration) {
+      seen.set(key, route);
+    }
+  }
+  return [...seen.values()];
+}
+
+function applyFilters(routes, trainTypeFilter, seatFilter) {
+  let result = routes;
+
+  if (trainTypeFilter) {
+    const chars = [...trainTypeFilter];
+    result = result.filter(r =>
+      r.segments.some(s => chars.some(ch => s.trainCode.startsWith(ch)))
+    );
+  }
+
+  if (seatFilter) {
+    const seatTypes = seatFilter.split(',').map(s => s.trim().toLowerCase());
+    result = result.filter(r =>
+      r.segments.every(s => seatTypes.every(st => hasSeat(s.seats[st])))
+    );
+  }
+
+  return result;
+}
+
+function heuristicRank(routes) {
+  for (const r of routes) {
+    let score = 0;
+    // Prefer fewer transfers
+    score -= r.transferCount * 100;
+    // Prefer shorter total duration
+    score -= r.totalDuration * 0.5;
+    // Prefer same-station transfer
+    if (r.sameStationTransfer) score += 50;
+    // Prefer same-train seat change
+    if (r.sameTrainSeatChange) score += 80;
+    // Prefer comfortable transfer time (20-60 min per transfer is ideal)
+    if (r.minTransferTime >= 20 && r.minTransferTime <= 60) score += 30;
+    // Penalize tight transfers (less than 15 min)
+    if (r.minTransferTime > 0 && r.minTransferTime < 15) score -= 40;
+    // Penalize long waits (more than 120 min)
+    if (r.minTransferTime > 120) score -= 20;
+    r.score = score;
+  }
+
+  return routes.sort((a, b) => b.score - a.score);
+}
+
 // --- Main ---
 
 const cookie = await getCookie();
 const candidatePool = buildCandidatePool(fromStation, toStation, stationData.STATIONS);
 console.error(`Candidate pool: ${candidatePool.length} stations`);
 
-const routes = await bfsSearch(fromStation, toStation, date, cookie, candidatePool, maxTransfers, minTransferTime);
-console.error(`\nTotal routes: ${routes.length}`);
+let routes = await bfsSearch(fromStation, toStation, date, cookie, candidatePool, maxTransfers, minTransferTime);
+console.error(`Total routes before dedup: ${routes.length}`);
 
-// Temporary: output first 5 routes as JSON to verify
+routes = deduplicateRoutes(routes);
+console.error(`After dedup: ${routes.length}`);
+
+routes = applyFilters(routes, trainTypeFilter, values.seat || '');
+console.error(`After filters: ${routes.length}`);
+
+routes = heuristicRank(routes);
+console.error(`Top routes:`);
+for (let i = 0; i < Math.min(5, routes.length); i++) {
+  const r = routes[i];
+  console.error(`  #${i + 1}: ${r.segments.map(s => s.trainCode).join('→')} | ${formatDurationStr(r.totalDuration)} | ${r.transferCount} transfers | score: ${r.score.toFixed(1)}`);
+}
+
+// Output top 5 as JSON (temporary, full output formatting comes later)
 console.log(JSON.stringify(routes.slice(0, 5), null, 2));
