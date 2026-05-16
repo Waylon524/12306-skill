@@ -1,11 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { loadStations, resolveStation } from './stations.mjs';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const { values, positionals } = parseArgs({
   options: {
@@ -54,3 +49,101 @@ if (!fromStation) { console.error(`Station not found: ${fromName}`); process.exi
 if (!toStation) { console.error(`Station not found: ${toName}`); process.exit(1); }
 
 console.error(`Searching transfers: ${fromStation.station_name} → ${toStation.station_name} on ${date} (max ${maxTransfers} transfers, min ${minTransferTime}m)`);
+
+// --- HTTP constants ---
+
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+  Referer: 'https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc',
+};
+
+const F = {
+  trainNo: 2, trainCode: 3, fromCode: 6, toCode: 7,
+  departTime: 8, arriveTime: 9, duration: 10, canBuy: 11, date: 13,
+  gr: 21, rw: 23, rz: 24, tz: 25, wz: 26, yw: 28, yz: 29,
+  ze: 30, zy: 31, swz: 32, dw: 33,
+};
+
+// --- Time & utility helpers ---
+
+function parseTime(s) {
+  const [h, m] = s.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function durationMinutes(raw) {
+  const [h, m] = raw.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function formatDuration(raw) {
+  const [h, m] = raw.split(':').map(Number);
+  if (isNaN(h) || isNaN(m)) return raw;
+  return h > 0 ? `${h}h${m.toString().padStart(2, '0')}m` : `${m}m`;
+}
+
+function hasSeat(val) {
+  return val && val !== '--' && val !== '' && val !== '无';
+}
+
+// --- API ---
+
+async function getCookie() {
+  const res = await fetch('https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc', {
+    headers: HEADERS,
+    redirect: 'manual',
+  });
+  const cookies = res.headers.getSetCookie?.() || [];
+  return cookies.map(c => c.split(';')[0]).join('; ');
+}
+
+async function queryTickets(from, to, travelDate, cookie) {
+  const params = new URLSearchParams({
+    'leftTicketDTO.train_date': travelDate,
+    'leftTicketDTO.from_station': from.station_code,
+    'leftTicketDTO.to_station': to.station_code,
+    purpose_codes: 'ADULT',
+  });
+
+  const res = await fetch(`https://kyfw.12306.cn/otn/leftTicket/query?${params}`, {
+    headers: { ...HEADERS, Cookie: cookie },
+  });
+
+  const json = await res.json();
+  if (!json.data?.result) return [];
+  return json.data.result.map(r => parseTicket(r, stationData.STATIONS));
+}
+
+function parseTicket(raw, stationMap) {
+  const f = raw.split('|');
+  const v = (key) => f[F[key]] || '--';
+  return {
+    trainNo: v('trainNo'), trainCode: v('trainCode'),
+    fromStation: stationMap[v('fromCode')]?.station_name || v('fromCode'),
+    toStation: stationMap[v('toCode')]?.station_name || v('toCode'),
+    fromCode: v('fromCode'), toCode: v('toCode'),
+    departTime: v('departTime'), arriveTime: v('arriveTime'),
+    duration: v('duration'), canBuy: v('canBuy'), date: v('date'),
+    swz: v('swz'), tz: v('tz'), zy: v('zy'), ze: v('ze'),
+    gr: v('gr'), rw: v('rw'), dw: v('dw'),
+    yw: v('yw'), rz: v('rz'), yz: v('yz'), wz: v('wz'),
+  };
+}
+
+async function batchQuery(from, stations, travelDate, cookie, concurrency = 15) {
+  const results = [];
+  for (let i = 0; i < stations.length; i += concurrency) {
+    const batch = stations.slice(i, i + concurrency);
+    const batchResults = await Promise.all(
+      batch.map(async (to) => {
+        const tickets = await queryTickets(from, to, travelDate, cookie);
+        return { toStation: to, tickets };
+      })
+    );
+    for (const r of batchResults) {
+      if (r.tickets.length > 0) results.push(r);
+    }
+    console.error(`  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(stations.length / concurrency)}: queried ${from.station_name} → ${batch.length} stations, ${batchResults.filter(r => r.tickets.length > 0).length} returned results`);
+  }
+  return results;
+}
