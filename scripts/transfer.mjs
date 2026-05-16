@@ -140,14 +140,16 @@ async function batchQuery(from, stations, travelDate, cookie, concurrency = 15) 
         return { toStation: to, tickets };
       })
     );
-    let successes = 0;
+    let count = 0;
     for (const r of batchResults) {
       if (r.status === 'fulfilled' && r.value.tickets.length > 0) {
         results.push(r.value);
-        successes++;
+        count++;
+      } else if (r.status === 'rejected') {
+        console.error(`  batch query failed: ${r.reason.message}`);
       }
     }
-    console.error(`  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(stations.length / concurrency)}: queried ${from.station_name} → ${batch.length} stations, ${successes} returned results`);
+    console.error(`  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(stations.length / concurrency)}: queried ${from.station_name} → ${batch.length} stations, ${count} returned results`);
   }
   return results;
 }
@@ -190,11 +192,11 @@ async function searchDirect(origin, destination, date, cookie) {
       duration: t.duration, canBuy: t.canBuy,
       seats: gatherSeats(t),
     }],
-    totalDuration: durationMinutes(t.duration),
+    totalDuration: t.duration && t.duration !== '--' ? durationMinutes(t.duration) : 0,
     transferCount: 0,
     transferStations: [],
-    sameStationTransfer: true,
-    sameTrainSeatChange: false,
+    sameStationTransfer: null,
+    sameTrainSeatChange: null,
     minTransferTime: 0,
     score: 0,
   }));
