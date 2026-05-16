@@ -76,12 +76,6 @@ function durationMinutes(raw) {
   return h * 60 + m;
 }
 
-function formatDuration(raw) {
-  const [h, m] = raw.split(':').map(Number);
-  if (isNaN(h) || isNaN(m)) return raw;
-  return h > 0 ? `${h}h${m.toString().padStart(2, '0')}m` : `${m}m`;
-}
-
 function formatDurationStr(minutes) {
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;
@@ -89,7 +83,7 @@ function formatDurationStr(minutes) {
 }
 
 function hasSeat(val) {
-  return val && val !== '--' && val !== '' && val !== '无';
+  return val && val !== '--' && val !== '' && val !== '无' && val !== '0';
 }
 
 // --- API ---
@@ -203,7 +197,7 @@ async function searchDirect(origin, destination, date, cookie) {
     transferStations: [],
     sameStationTransfer: null,
     sameTrainSeatChange: null,
-    minTransferTime: 0,
+    actualMinTransfer: 0,
     score: 0,
   }));
 }
@@ -249,7 +243,7 @@ function buildRoute(segments) {
     transferStations,
     sameStationTransfer: transferStations.length > 0 ? sameStation : null,
     sameTrainSeatChange: transferStations.length > 0 ? sameTrain : null,
-    minTransferTime: minTransferTimes.length > 0 ? Math.min(...minTransferTimes) : 0,
+    actualMinTransfer: minTransferTimes.length > 0 ? Math.min(...minTransferTimes) : 0,
     score: 0,
   };
 }
@@ -444,11 +438,11 @@ function heuristicRank(routes) {
     // Prefer same-train seat change
     if (r.sameTrainSeatChange) score += 80;
     // Prefer comfortable transfer time (20-60 min per transfer is ideal)
-    if (r.minTransferTime >= 20 && r.minTransferTime <= 60) score += 30;
+    if (r.actualMinTransfer >= 20 && r.actualMinTransfer <= 60) score += 30;
     // Penalize tight transfers (less than 15 min)
-    if (r.minTransferTime > 0 && r.minTransferTime < 15) score -= 40;
+    if (r.actualMinTransfer > 0 && r.actualMinTransfer < 15) score -= 40;
     // Penalize long waits (more than 120 min)
-    if (r.minTransferTime > 120) score -= 20;
+    if (r.actualMinTransfer > 120) score -= 20;
     r.score = score;
   }
 
