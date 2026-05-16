@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
+import { writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadStations, resolveStation } from './stations.mjs';
 import OpenAI from 'openai';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const { values, positionals } = parseArgs({
   options: {
@@ -550,6 +555,99 @@ function buildMarkdown(results, fromName, toName, travelDate, preference) {
   return lines.join('\n');
 }
 
+function buildHTML(results, from, to, travelDate, preference) {
+  const e = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const fn = e(from.station_name), tn = e(to.station_name);
+
+  const rows = results.map((r, idx) => {
+    const segmentsHTML = r.segments.map((s, si) => `
+      <div class="segment">
+        <span class="train-code type-${s.trainCode[0]?.toLowerCase() || ''}">${e(s.trainCode)}</span>
+        <span class="sta">${e(s.fromStation)}</span>
+        <span class="time depart">${e(s.departTime)}</span>
+        <span class="arrow">→</span>
+        <span class="time arrive">${e(s.arriveTime)}</span>
+        <span class="sta">${e(s.toStation)}</span>
+        <span class="dur">${e(s.duration)}</span>
+        ${si < r.segments.length - 1 ? `<div class="transfer-gap">换乘 ${r.transferStations[si] ? e(r.transferStations[si]) : ''} · ${r.actualMinTransfer}分钟</div>` : ''}
+      </div>`).join('');
+
+    const tags = [];
+    if (r.sameTrainSeatChange) tags.push('<span class="tag tag-train">同车换座</span>');
+    if (r.sameStationTransfer && r.transferCount > 0) tags.push('<span class="tag tag-station">同站换乘</span>');
+    if (r.transferCount === 0) tags.push('<span class="tag tag-direct">直达</span>');
+
+    return `
+    <div class="route-card">
+      <div class="route-header">
+        <span class="route-rank">#${idx + 1}</span>
+        <span class="route-summary">总耗时 ${formatDurationStr(r.totalDuration)} · ${r.transferCount === 0 ? '直达' : r.transferCount + '次换乘'}</span>
+        <span class="route-tags">${tags.join('')}</span>
+      </div>
+      <div class="route-segments">${segmentsHTML}</div>
+      <div class="route-reason">${e(r.reason || '')}</div>
+    </div>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${fn} → ${tn} 换乘推荐</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; background: #f5f5f7; color: #1d1d1f; }
+  .container { max-width: 900px; margin: 0 auto; padding: 40px 20px; }
+  header { text-align: center; margin-bottom: 32px; }
+  h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.5px; }
+  h1 .arrow { margin: 0 12px; color: #86868b; font-weight: 300; }
+  .meta { margin-top: 8px; color: #86868b; font-size: 15px; }
+  .pref { display: inline-block; margin-top: 8px; background: #0071e3; color: #fff; padding: 2px 12px; border-radius: 20px; font-size: 13px; }
+  .route-card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .route-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; }
+  .route-rank { background: #0071e3; color: #fff; width: 28px; height: 28px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 600; }
+  .route-summary { font-weight: 600; font-size: 15px; }
+  .route-tags { margin-left: auto; display: flex; gap: 6px; }
+  .tag { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+  .tag-train { background: #fff3e0; color: #e65100; }
+  .tag-station { background: #e8f5e9; color: #2e7d32; }
+  .tag-direct { background: #e3f2fd; color: #1565c0; }
+  .segment { padding: 6px 0; display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .train-code { font-weight: 600; min-width: 50px; }
+  .type-g { color: #0071e3; }
+  .type-d { color: #34c759; }
+  .type-z { color: #af52de; }
+  .type-t { color: #ff9500; }
+  .type-k { color: #86868b; }
+  .sta { color: #6e6e73; min-width: 60px; }
+  .time { font-variant-numeric: tabular-nums; }
+  .depart { font-weight: 600; }
+  .arrive { color: #6e6e73; }
+  .arrow { color: #c0c0c0; margin: 0 4px; }
+  .dur { color: #86868b; font-size: 13px; }
+  .transfer-gap { width: 100%; padding: 4px 0 4px 58px; color: #ff9500; font-size: 12px; }
+  .route-reason { margin-top: 12px; padding-top: 12px; border-top: 1px solid #f0f0f0; color: #6e6e73; font-size: 13px; }
+  .empty { padding: 60px 20px; text-align: center; color: #86868b; font-size: 15px; }
+  footer { text-align: center; margin-top: 24px; color: #c0c0c0; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>${fn}<span class="arrow">→</span>${tn}</h1>
+    <div class="meta">${e(travelDate)} · 换乘推荐 · ${results.length} 个方案</div>
+    ${preference ? `<div class="pref">${e(preference)}</div>` : ''}
+  </header>
+  ${results.length === 0
+    ? '<div class="empty">未找到符合条件的换乘方案</div>'
+    : rows}
+  <footer>数据来源 12306 · ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</footer>
+</div>
+</body>
+</html>`;
+}
+
 // --- Main ---
 
 const cookie = await getCookie();
@@ -594,7 +692,13 @@ const fmt = values.format?.toLowerCase() || 'md';
 
 if (fmt === 'json') {
   console.log(JSON.stringify({ from: fromStation.station_name, to: toStation.station_name, date, totalRoutes: routes.length, recommendations: finalResults }, null, 2));
-} else if (fmt === 'md') {
+} else if (fmt === 'html') {
+  const html = buildHTML(finalResults, fromStation, toStation, date, values.preference);
+  const outPath = join(__dirname, '..', 'data', `transfer-${fromStation.station_name}-${toStation.station_name}-${date}.html`);
+  writeFileSync(outPath, html);
+  console.error(`Saved to ${outPath}`);
+  console.log(outPath);
+} else {
   console.error(`\n${finalResults.length} recommendations.`);
   console.log(buildMarkdown(finalResults, fromStation.station_name, toStation.station_name, date, values.preference));
 }
