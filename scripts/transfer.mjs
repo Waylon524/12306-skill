@@ -202,18 +202,194 @@ async function searchDirect(origin, destination, date, cookie) {
   }));
 }
 
+// --- BFS helper functions ---
+
+function canConnect(prevArrive, nextDepart, minTransferMinutes) {
+  return parseTime(nextDepart) >= parseTime(prevArrive) + minTransferMinutes;
+}
+
+function buildRoute(segments) {
+  const first = segments[0];
+  const last = segments[segments.length - 1];
+  const totalDur = segments.reduce((sum, s) => sum + durationMinutes(s.duration), 0);
+  const transferStations = [];
+  const minTransferTimes = [];
+  let sameStation = true;
+  let sameTrain = false;
+
+  for (let i = 1; i < segments.length; i++) {
+    const prev = segments[i - 1];
+    const curr = segments[i];
+    transferStations.push(prev.toStation);
+    const gap = parseTime(curr.departTime) - parseTime(prev.arriveTime);
+    minTransferTimes.push(gap);
+    if (prev.toCode !== curr.fromCode) sameStation = false;
+    if (prev.trainCode === curr.trainCode) sameTrain = true;
+  }
+
+  return {
+    segments,
+    totalDuration: totalDur,
+    transferCount: segments.length - 1,
+    transferStations,
+    sameStationTransfer: transferStations.length > 0 ? sameStation : null,
+    sameTrainSeatChange: transferStations.length > 0 ? sameTrain : null,
+    minTransferTime: minTransferTimes.length > 0 ? Math.min(...minTransferTimes) : 0,
+    score: 0,
+  };
+}
+
+function wrapSegment(t, fromName, fromCode, toName, toCode) {
+  return {
+    trainCode: t.trainCode, trainNo: t.trainNo,
+    fromStation: fromName, fromCode,
+    toStation: toName, toCode,
+    departTime: t.departTime, arriveTime: t.arriveTime,
+    duration: t.duration, canBuy: t.canBuy,
+    seats: gatherSeats(t),
+  };
+}
+
+// --- BFS multi-layer transfer search ---
+
+async function bfsSearch(origin, destination, date, cookie, candidatePool, maxTransfers, minTransferTime) {
+  const allRoutes = [];
+
+  // Layer 0: direct trains
+  console.error('Layer 0: direct search');
+  const directs = await searchDirect(origin, destination, date, cookie);
+  allRoutes.push(...directs);
+
+  if (maxTransfers === 0) return allRoutes;
+
+  // Layer 1: origin → candidate stations
+  console.error(`Layer 1: origin → ${candidatePool.length} candidates`);
+  const firstHops = await batchQuery(origin, candidatePool, date, cookie);
+  console.error(`  ${firstHops.length} stations reachable from origin`);
+
+  // For each first hop, try → destination (goal-directed)
+  console.error('Layer 1: goal-directed (firstHop → destination)');
+  const destResults = new Map(); // cache: station_code → tickets to dest
+
+  // Collect all first-hop tickets with their arrival times
+  const firstHopTickets = [];
+  for (const { toStation, tickets } of firstHops) {
+    for (const t1 of tickets) {
+      firstHopTickets.push({ midStation: toStation, ticket: t1 });
+    }
+  }
+
+  // Limit to top 50 by earliest arrival for performance
+  const activeFirstHops = firstHopTickets
+    .sort((a, b) => parseTime(a.ticket.arriveTime) - parseTime(b.ticket.arriveTime))
+    .slice(0, 50);
+
+  for (let i = 0; i < activeFirstHops.length; i++) {
+    const { midStation, ticket: t1 } = activeFirstHops[i];
+    if (i % 10 === 0) console.error(`  goal-directed ${i + 1}/${activeFirstHops.length}`);
+
+    let destTickets = destResults.get(midStation.station_code);
+    if (!destTickets) {
+      destTickets = await queryTickets(midStation, destination, date, cookie);
+      destResults.set(midStation.station_code, destTickets);
+    }
+
+    for (const t2 of destTickets) {
+      if (canConnect(t1.arriveTime, t2.departTime, minTransferTime)) {
+        allRoutes.push(buildRoute([
+          wrapSegment(t1, origin.station_name, origin.station_code, midStation.station_name, midStation.station_code),
+          wrapSegment(t2, midStation.station_name, midStation.station_code, destination.station_name, destination.station_code),
+        ]));
+      }
+    }
+  }
+
+  console.error(`  Found ${allRoutes.length} total routes so far`);
+
+  // Layer 2+: expand further if more transfers allowed
+  if (maxTransfers >= 2) {
+    console.error('Layer 2+: multi-transfer search');
+
+    for (let h = 0; h < activeFirstHops.length && h < 15; h++) {
+      const { midStation: hop1Station, ticket: t1 } = activeFirstHops[h];
+      console.error(`  Layer 2 branch ${h + 1}/15: ${hop1Station.station_name}`);
+
+      const secondHops = await batchQuery(hop1Station, candidatePool, date, cookie);
+
+      // Limit second hops to top 10 by arrival time
+      const activeSecondHops = secondHops
+        .flatMap(hh => hh.tickets.map(t2 => ({ midStation2: hh.toStation, ticket: t2 })))
+        .filter(hh => canConnect(t1.arriveTime, hh.ticket.departTime, minTransferTime))
+        .filter(hh => hh.midStation2.station_code !== origin.station_code && hh.midStation2.station_code !== hop1Station.station_code)
+        .sort((a, b) => parseTime(a.ticket.arriveTime) - parseTime(b.ticket.arriveTime))
+        .slice(0, 10);
+
+      for (const { midStation2, ticket: t2 } of activeSecondHops) {
+        // Goal-directed: midStation2 → destination
+        let destTickets = destResults.get(midStation2.station_code);
+        if (!destTickets) {
+          destTickets = await queryTickets(midStation2, destination, date, cookie);
+          destResults.set(midStation2.station_code, destTickets);
+        }
+
+        for (const t3 of destTickets) {
+          if (canConnect(t2.arriveTime, t3.departTime, minTransferTime)) {
+            allRoutes.push(buildRoute([
+              wrapSegment(t1, origin.station_name, origin.station_code, hop1Station.station_name, hop1Station.station_code),
+              wrapSegment(t2, hop1Station.station_name, hop1Station.station_code, midStation2.station_name, midStation2.station_code),
+              wrapSegment(t3, midStation2.station_name, midStation2.station_code, destination.station_name, destination.station_code),
+            ]));
+          }
+        }
+
+        // Layer 3: one more level
+        if (maxTransfers >= 3) {
+          const thirdHops = await batchQuery(midStation2, candidatePool, date, cookie);
+
+          const activeThirdHops = thirdHops
+            .flatMap(hh => hh.tickets.map(t3 => ({ midStation3: hh.toStation, ticket: t3 })))
+            .filter(hh => canConnect(t2.arriveTime, hh.ticket.departTime, minTransferTime))
+            .filter(hh => hh.midStation3.station_code !== origin.station_code
+              && hh.midStation3.station_code !== hop1Station.station_code
+              && hh.midStation3.station_code !== midStation2.station_code)
+            .sort((a, b) => parseTime(a.ticket.arriveTime) - parseTime(b.ticket.arriveTime))
+            .slice(0, 5);
+
+          for (const { midStation3, ticket: t3 } of activeThirdHops) {
+            let destTickets3 = destResults.get(midStation3.station_code);
+            if (!destTickets3) {
+              destTickets3 = await queryTickets(midStation3, destination, date, cookie);
+              destResults.set(midStation3.station_code, destTickets3);
+            }
+
+            for (const t4 of destTickets3) {
+              if (canConnect(t3.arriveTime, t4.departTime, minTransferTime)) {
+                allRoutes.push(buildRoute([
+                  wrapSegment(t1, origin.station_name, origin.station_code, hop1Station.station_name, hop1Station.station_code),
+                  wrapSegment(t2, hop1Station.station_name, hop1Station.station_code, midStation2.station_name, midStation2.station_code),
+                  wrapSegment(t3, midStation2.station_name, midStation2.station_code, midStation3.station_name, midStation3.station_code),
+                  wrapSegment(t4, midStation3.station_name, midStation3.station_code, destination.station_name, destination.station_code),
+                ]));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  console.error(`Total routes found: ${allRoutes.length}`);
+  return allRoutes;
+}
+
 // --- Main ---
 
 const cookie = await getCookie();
 const candidatePool = buildCandidatePool(fromStation, toStation, stationData.STATIONS);
 console.error(`Candidate pool: ${candidatePool.length} stations`);
 
-// Layer 0: direct
-const directs = await searchDirect(fromStation, toStation, date, cookie);
-console.error(`Direct trains: ${directs.length}`);
+const routes = await bfsSearch(fromStation, toStation, date, cookie, candidatePool, maxTransfers, minTransferTime);
+console.error(`\nTotal routes: ${routes.length}`);
 
-// Layer 1: first hops from origin
-const firstHops = await batchQuery(fromStation, candidatePool, date, cookie);
-console.error(`First hops: ${firstHops.length} stations reachable from origin`);
-
-console.log(JSON.stringify({ directs: directs.length, firstHops: firstHops.length }, null, 2));
+// Temporary: output first 5 routes as JSON to verify
+console.log(JSON.stringify(routes.slice(0, 5), null, 2));
