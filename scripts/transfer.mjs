@@ -134,16 +134,84 @@ async function batchQuery(from, stations, travelDate, cookie, concurrency = 15) 
   const results = [];
   for (let i = 0; i < stations.length; i += concurrency) {
     const batch = stations.slice(i, i + concurrency);
-    const batchResults = await Promise.all(
+    const batchResults = await Promise.allSettled(
       batch.map(async (to) => {
         const tickets = await queryTickets(from, to, travelDate, cookie);
         return { toStation: to, tickets };
       })
     );
+    let successes = 0;
     for (const r of batchResults) {
-      if (r.tickets.length > 0) results.push(r);
+      if (r.status === 'fulfilled' && r.value.tickets.length > 0) {
+        results.push(r.value);
+        successes++;
+      }
     }
-    console.error(`  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(stations.length / concurrency)}: queried ${from.station_name} → ${batch.length} stations, ${batchResults.filter(r => r.tickets.length > 0).length} returned results`);
+    console.error(`  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(stations.length / concurrency)}: queried ${from.station_name} → ${batch.length} stations, ${successes} returned results`);
   }
   return results;
 }
+
+// --- Candidate pool ---
+
+function buildCandidatePool(origin, destination, stationMap) {
+  // Include all stations as candidates, excluding origin and destination themselves
+  const exclude = new Set([origin.station_code, destination.station_code]);
+  const pool = [];
+  for (const code of Object.keys(stationMap)) {
+    if (!exclude.has(code)) {
+      pool.push(stationMap[code]);
+    }
+  }
+  return pool;
+}
+
+// --- Seat gathering ---
+
+function gatherSeats(t) {
+  return {
+    swz: t.swz !== '--' ? t.swz : (t.tz !== '--' ? t.tz : '--'),
+    zy: t.zy, ze: t.ze,
+    rw: t.rw !== '--' ? t.rw : (t.dw !== '--' ? t.dw : '--'),
+    yw: t.yw, yz: t.yz, wz: t.wz,
+  };
+}
+
+// --- Layer 0: direct search ---
+
+async function searchDirect(origin, destination, date, cookie) {
+  const tickets = await queryTickets(origin, destination, date, cookie);
+  return tickets.map(t => ({
+    segments: [{
+      trainCode: t.trainCode, trainNo: t.trainNo,
+      fromStation: t.fromStation, toStation: t.toStation,
+      fromCode: t.fromCode, toCode: t.toCode,
+      departTime: t.departTime, arriveTime: t.arriveTime,
+      duration: t.duration, canBuy: t.canBuy,
+      seats: gatherSeats(t),
+    }],
+    totalDuration: durationMinutes(t.duration),
+    transferCount: 0,
+    transferStations: [],
+    sameStationTransfer: true,
+    sameTrainSeatChange: false,
+    minTransferTime: 0,
+    score: 0,
+  }));
+}
+
+// --- Main ---
+
+const cookie = await getCookie();
+const candidatePool = buildCandidatePool(fromStation, toStation, stationData.STATIONS);
+console.error(`Candidate pool: ${candidatePool.length} stations`);
+
+// Layer 0: direct
+const directs = await searchDirect(fromStation, toStation, date, cookie);
+console.error(`Direct trains: ${directs.length}`);
+
+// Layer 1: first hops from origin
+const firstHops = await batchQuery(fromStation, candidatePool, date, cookie);
+console.error(`First hops: ${firstHops.length} stations reachable from origin`);
+
+console.log(JSON.stringify({ directs: directs.length, firstHops: firstHops.length }, null, 2));
