@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { loadStations, resolveStation } from './stations.mjs';
+import OpenAI from 'openai';
 
 const { values, positionals } = parseArgs({
   options: {
@@ -449,6 +450,76 @@ function heuristicRank(routes) {
   return routes.sort((a, b) => b.score - a.score);
 }
 
+async function llmRank(routes, preference, fromName, toName, travelDate, model) {
+  const openai = new OpenAI(); // uses OPENAI_API_KEY from env
+
+  const systemPrompt = `你是 12306 换乘推荐助手。根据用户偏好对候选路线排序，给出前 5 名推荐及简要理由。
+偏好维度包括：总耗时、换乘次数、换乘时间充裕度、同站换乘、同车换座。`;
+
+  const topN = routes.slice(0, 30);
+
+  // Build a compact version for LLM, with index mapping back to original routes
+  const compactRoutes = topN.map((r, i) => ({
+    idx: i,
+    totalDuration: formatDurationStr(r.totalDuration),
+    totalDurationMin: r.totalDuration,
+    transferCount: r.transferCount,
+    transferStations: r.transferStations,
+    sameStationTransfer: r.sameStationTransfer,
+    sameTrainSeatChange: r.sameTrainSeatChange,
+    actualMinTransfer: r.actualMinTransfer,
+    segments: r.segments.map(s => ({
+      trainCode: s.trainCode,
+      fromStation: s.fromStation,
+      toStation: s.toStation,
+      departTime: s.departTime,
+      arriveTime: s.arriveTime,
+      duration: s.duration,
+      canBuy: s.canBuy,
+      seats: s.seats,
+    })),
+  }));
+
+  const userPrompt = `用户偏好: ${preference || '综合最优'}
+出发: ${fromName} 到达: ${toName} 日期: ${travelDate}
+
+候选路线 (JSON):
+${JSON.stringify(compactRoutes, null, 2)}
+
+请返回 JSON 数组（不要包含 markdown 代码块标记），按推荐度排序。数组中每项必须是候选路线中的一条（通过 idx 标识），并添加 "reason" 字段（中文推荐理由，一句话）。只返回前5名。格式：[{"idx": 0, "reason": "..."}, {"idx": 3, "reason": "..."}, ...]`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.3,
+      max_tokens: 4000,
+    });
+
+    const text = response.choices[0].message.content.trim();
+    // Strip markdown code fences if present
+    const json = JSON.parse(text.replace(/^```json\s*/, '').replace(/```$/, ''));
+    // Map LLM response (idx + reason) back to original route objects
+    return json.map(item => ({
+      ...topN[item.idx],
+      reason: item.reason,
+    }));
+  } catch (err) {
+    console.error(`LLM ranking failed: ${err.message}`);
+    return null;
+  }
+}
+
+function heuristicRoutesToOutput(routes) {
+  return routes.map(r => ({
+    ...r,
+    reason: '（未使用 AI 排序）',
+  }));
+}
+
 // --- Main ---
 
 const cookie = await getCookie();
@@ -465,11 +536,28 @@ routes = applyFilters(routes, trainTypeFilter, values.seat || '');
 console.error(`After filters: ${routes.length}`);
 
 routes = heuristicRank(routes);
-console.error(`Top routes:`);
-for (let i = 0; i < Math.min(5, routes.length); i++) {
-  const r = routes[i];
-  console.error(`  #${i + 1}: ${r.segments.map(s => s.trainCode).join('→')} | ${formatDurationStr(r.totalDuration)} | ${r.transferCount} transfers | score: ${r.score.toFixed(1)}`);
+
+let finalResults;
+if (useLLM && routes.length > 0) {
+  console.error('Calling LLM for ranking...');
+  const llmResults = await llmRank(
+    routes,
+    values.preference || '',
+    fromStation.station_name,
+    toStation.station_name,
+    date,
+    values.model
+  );
+
+  if (llmResults) {
+    finalResults = llmResults;
+  } else {
+    console.error('LLM failed, falling back to heuristic ranking');
+    finalResults = heuristicRoutesToOutput(routes.slice(0, 5));
+  }
+} else {
+  finalResults = heuristicRoutesToOutput(routes.slice(0, 5));
 }
 
-// Output top 5 as JSON (temporary, full output formatting comes later)
-console.log(JSON.stringify(routes.slice(0, 5), null, 2));
+// Temporary output until formatting tasks
+console.log(JSON.stringify(finalResults, null, 2));
