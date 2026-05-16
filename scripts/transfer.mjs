@@ -520,6 +520,36 @@ function heuristicRoutesToOutput(routes) {
   }));
 }
 
+function buildMarkdown(results, fromName, toName, travelDate, preference) {
+  const lines = [];
+  lines.push(`## ${fromName} → ${toName} | ${travelDate} | 换乘推荐`);
+  lines.push('');
+  if (preference) lines.push(`偏好：${preference}`);
+  lines.push('');
+  lines.push('| # | 方案 | 总耗时 | 换乘 | 换乘站 | 详情 | 状态 | 推荐理由 |');
+  lines.push('|---|------|--------|------|--------|------|------|----------|');
+
+  for (let idx = 0; idx < results.length; idx++) {
+    const r = results[idx];
+    const trainChain = r.segments.map(s => s.trainCode).join('→');
+    const transfers = r.transferCount === 0 ? '直达' : `${r.transferCount}次`;
+    const transferStations = r.transferStations.join('→') || '—';
+    const timeRange = `${r.segments[0].departTime}-${r.segments[r.segments.length - 1].arriveTime}`;
+    const buyStatus = r.segments.every(s => s.canBuy === 'Y') ? '✅' : '⚠';
+    const reason = r.reason || '';
+    lines.push(`| ${idx + 1} | ${trainChain} | ${formatDurationStr(r.totalDuration)} | ${transfers} | ${transferStations} | ${timeRange} | ${buyStatus} | ${reason} |`);
+
+    if (r.sameTrainSeatChange) {
+      lines.push(`| | 💡 **同车换座**：${r.segments[0].trainCode} 在 ${r.transferStations.join('、')} 换座位即可 | | | | | | |`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`⚠ 数据来源 12306 · ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
+
+  return lines.join('\n');
+}
+
 // --- Main ---
 
 const cookie = await getCookie();
@@ -559,5 +589,12 @@ if (useLLM && routes.length > 0) {
   finalResults = heuristicRoutesToOutput(routes.slice(0, 5));
 }
 
-// Temporary output until formatting tasks
-console.log(JSON.stringify(finalResults, null, 2));
+// --- Output ---
+const fmt = values.format?.toLowerCase() || 'md';
+
+if (fmt === 'json') {
+  console.log(JSON.stringify({ from: fromStation.station_name, to: toStation.station_name, date, totalRoutes: routes.length, recommendations: finalResults }, null, 2));
+} else if (fmt === 'md') {
+  console.error(`\n${finalResults.length} recommendations.`);
+  console.log(buildMarkdown(finalResults, fromStation.station_name, toStation.station_name, date, values.preference));
+}
