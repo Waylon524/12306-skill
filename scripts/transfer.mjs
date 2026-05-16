@@ -99,32 +99,24 @@ function hasSeat(val) {
 // --- API ---
 
 async function getCookie() {
-  const res = await fetch('https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc', {
-    headers: HEADERS,
-    redirect: 'manual',
-  });
-  const cookies = res.headers.getSetCookie?.() || [];
-  return cookies.map(c => c.split(';')[0]).join('; ');
-}
-
-async function queryTickets(from, to, travelDate, cookie) {
-  const params = new URLSearchParams({
-    'leftTicketDTO.train_date': travelDate,
-    'leftTicketDTO.from_station': from.station_code,
-    'leftTicketDTO.to_station': to.station_code,
-    purpose_codes: 'ADULT',
-  });
-
-  const res = await fetch(`https://kyfw.12306.cn/otn/leftTicket/query?${params}`, {
-    headers: { ...HEADERS, Cookie: cookie },
-  });
-
-  const json = await res.json();
-  if (!json.data?.result) return [];
-  return json.data.result.map(r => parseTicket(r, stationData.STATIONS));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch('https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc', {
+      headers: HEADERS,
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+    const cookies = res.headers.getSetCookie?.() || [];
+    return cookies.map(c => c.split(';')[0]).join('; ');
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function queryTicketsSafe(from, to, travelDate, cookie) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
   try {
     const params = new URLSearchParams({
       'leftTicketDTO.train_date': travelDate,
@@ -135,6 +127,7 @@ async function queryTicketsSafe(from, to, travelDate, cookie) {
 
     const res = await fetch(`https://kyfw.12306.cn/otn/leftTicket/query?${params}`, {
       headers: { ...HEADERS, Cookie: cookie },
+      signal: controller.signal,
     });
 
     if (!res.ok) {
@@ -144,8 +137,8 @@ async function queryTicketsSafe(from, to, travelDate, cookie) {
     const json = await res.json();
     if (!json.data?.result) return [];
     return json.data.result.map(r => parseTicket(r, stationData.STATIONS));
-  } catch (err) {
-    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -208,8 +201,10 @@ function buildCandidatePool(origin, destination, stationMap) {
 function gatherSeats(t) {
   return {
     swz: t.swz !== '--' ? t.swz : (t.tz !== '--' ? t.tz : '--'),
+    tz: t.tz,
     zy: t.zy, ze: t.ze,
     rw: t.rw !== '--' ? t.rw : (t.dw !== '--' ? t.dw : '--'),
+    dw: t.dw,
     yw: t.yw, yz: t.yz, wz: t.wz,
   };
 }
@@ -508,6 +503,11 @@ function heuristicRank(routes) {
 }
 
 async function llmRank(routes, preference, fromName, toName, travelDate, model) {
+  if (!process.env.OPENAI_API_KEY) {
+    console.error('OPENAI_API_KEY not set, skipping LLM ranking');
+    return null;
+  }
+
   const openai = new OpenAI(); // uses OPENAI_API_KEY from env
 
   const systemPrompt = `你是 12306 换乘推荐助手。根据用户偏好对候选路线排序，给出前 5 名推荐及简要理由。
@@ -560,10 +560,11 @@ ${JSON.stringify(compactRoutes, null, 2)}
     // Strip markdown code fences if present
     const json = JSON.parse(text.replace(/^```json\s*/, '').replace(/```$/, ''));
     // Map LLM response (idx + reason) back to original route objects
-    return json.map(item => ({
-      ...topN[item.idx],
-      reason: item.reason,
-    }));
+    return json.map(item => {
+      const route = topN[item.idx];
+      if (!route) return null;
+      return { ...route, reason: item.reason };
+    }).filter(Boolean);
   } catch (err) {
     console.error(`LLM ranking failed: ${err.message}`);
     return null;
